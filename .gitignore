@@ -1,0 +1,2 @@
+# Per-machine values (Bluetooth addresses, ssh user); see host/bt-pi.config.local.example.psd1
+host/bt-pi.config.local.psd1

@@ -1,0 +1,21 @@
+# bt-autoconnect configuration (read by /usr/local/sbin/bt-autoconnect)
+
+# Bluetooth address of the host PC (Windows: Get-NetAdapter "Bluetooth Network Connection").
+# Filled in by install.sh from HOST_MAC (deploy-pi.ps1 passes HostBtAddress
+# from host\bt-pi.config.local.psd1).
+HOST_MAC=
+
+ADAPTER=hci0
+BRIDGE=pan0
+
+# auto   = discoverable only until HOST_MAC has paired
+# always = always discoverable (pairing still restricted to HOST_MAC)
+# off    = never discoverable
+PAIRING_MODE=auto
+
+# Dial the host when no PAN link is up: its NAP service (internet sharing) if
+# offered, else its PANU service.
+DIAL_HOST=yes
+
+CHECK_INTERVAL=5
+MAX_BACKOFF=60

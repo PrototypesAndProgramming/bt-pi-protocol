@@ -1,0 +1,10 @@
+# Any BNEP link (host->NAP or Pi->host PANU) joins the pan0 bridge.
+[Match]
+Name=bnep*
+
+[Link]
+RequiredForOnline=no
+
+[Network]
+Bridge=pan0
+LinkLocalAddressing=no

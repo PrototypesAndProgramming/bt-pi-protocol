@@ -1,0 +1,10 @@
+# Bridge that BlueZ's NAP server (and outgoing PANU links) attach bnep* to.
+[NetDev]
+Name=pan0
+Kind=bridge
+# Fixed MAC (= Pi BT address) so the IPv6 link-local fallback address is stable.
+MACAddress=@BT_MAC@
+
+[Bridge]
+STP=no
+ForwardDelaySec=0

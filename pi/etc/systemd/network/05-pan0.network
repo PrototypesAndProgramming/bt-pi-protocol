@@ -1,0 +1,21 @@
+[Match]
+Name=pan0
+
+[Link]
+RequiredForOnline=no
+
+[Network]
+# Address, gateway and DNS come from the host's DHCP server: Windows Mobile
+# hotspot shared over Bluetooth (ICS picks the subnet, e.g. 192.168.137/138.x).
+# The IPv6 link-local address (from the fixed bridge MAC) is always reachable
+# from the host while the link is up, even without DHCP:
+#   fe80::<EUI-64 of the Pi BT address>  (AA:BB:CC:DD:EE:FF -> fe80::a8bb:ccff:fedd:eeff)
+# Configuration (and DHCP) restarts whenever a bnep link joins the bridge.
+DHCP=ipv4
+LinkLocalAddressing=ipv6
+IPv6AcceptRA=no
+
+[DHCPv4]
+# Prefer the Bluetooth uplink over eth0 (DHCP metric 100) when both exist.
+RouteMetric=50
+SendHostname=yes

@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""bt-autoconnect - keep a Bluetooth PAN link between this Pi and one host PC.
+
+Roles:
+  * The Pi dials the host whenever no link is up, so a freshly booted Pi
+    brings the link up without any action on the host:
+      - to the host's NAP service when the host shares its internet
+        (Windows: Mobile hotspot, "Share over: Bluetooth"), else
+      - to the host's PANU service (point-to-point link, no internet).
+    The bnep link joins bridge BRIDGE (pan0), which gets its IP by DHCP.
+  * The Pi also registers a BlueZ NAP server on BRIDGE, so the host can
+    connect to it as PANU ("Connect using > Access point" on Windows).
+  * A pairing agent accepts pairing/authorization only from HOST_MAC.
+  * The adapter is discoverable only while the host is not paired yet
+    (PAIRING_MODE=auto), so first-time pairing needs no shell on the Pi.
+
+Configuration: /etc/default/bt-autoconnect (KEY=VALUE).
+"""
+import glob
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+CONF_FILE = "/etc/default/bt-autoconnect"
+DEFAULTS = {
+    "HOST_MAC": "",
+    "ADAPTER": "hci0",
+    "BRIDGE": "pan0",
+    "PAIRING_MODE": "auto",     # auto | always | off
+    "DIAL_HOST": "yes",         # dial the host (NAP, else PANU) when no link is up
+    "CHECK_INTERVAL": "5",      # seconds between health checks
+    "MAX_BACKOFF": "60",        # cap for the reconnect backoff, seconds
+}
+
+BLUEZ = "org.bluez"
+AGENT_PATH = "/org/bluez/btautoconnect/agent"
+SDP_STAMP = "/run/bt-autoconnect.sdp-refresh"
+SDP_REFRESH_EVERY = 60     # seconds between SDP cache refreshes
+DHCP_GRACE = 20            # seconds a link may lack an IPv4 lease before a kick
+DHCP_KICK_EVERY = 60
+PROPS = "org.freedesktop.DBus.Properties"
+
+log = logging.getLogger("bt-autoconnect")
+
+
+def load_conf():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONF_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                cfg[key.strip()] = val.strip().strip("'\"")
+    except FileNotFoundError:
+        log.warning("%s not found, using defaults", CONF_FILE)
+    return cfg
+
+
+def unblock_rfkill():
+    """Clear soft rfkill blocks on Bluetooth radios (no rfkill binary needed)."""
+    base = "/sys/class/rfkill"
+    for name in os.listdir(base) if os.path.isdir(base) else []:
+        try:
+            with open(os.path.join(base, name, "type")) as f:
+                if f.read().strip() != "bluetooth":
+                    continue
+            with open(os.path.join(base, name, "soft"), "w") as f:
+                f.write("0")
+        except OSError:
+            pass
+
+
+class Rejected(dbus.DBusException):
+    _dbus_error_name = "org.bluez.Error.Rejected"
+
+
+class Agent(dbus.service.Object):
+    """Pairing agent: auto-accepts the configured host, rejects everyone else."""
+
+    def __init__(self, bus, daemon):
+        super().__init__(bus, AGENT_PATH)
+        self.daemon = daemon
+
+    def _check(self, device, what):
+        addr = self.daemon.addr_of(device)
+        if addr == self.daemon.host:
+            log.info("agent: accepting %s from host %s", what, addr)
+            return
+        log.warning("agent: rejecting %s from unknown device %s", what, addr)
+        raise Rejected("Only the configured host may pair")
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+    def Release(self):
+        log.info("agent released")
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        self._check(device, "service %s" % uuid)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        self._check(device, "PIN request")
+        return "0000"
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        self._check(device, "passkey request")
+        return dbus.UInt32(0)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        pass
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        pass
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        self._check(device, "confirmation (passkey %06d)" % passkey)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        self._check(device, "authorization")
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+    def Cancel(self):
+        log.info("agent: request cancelled")
+
+
+class Daemon:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.host = cfg["HOST_MAC"].upper()
+        self.bridge = cfg["BRIDGE"]
+        self.mode = cfg["PAIRING_MODE"].lower()
+        self.dial_host = cfg["DIAL_HOST"].lower() in ("1", "yes", "true", "on")
+        self.interval = max(1, int(cfg["CHECK_INTERVAL"]))
+        self.max_backoff = max(self.interval, int(cfg["MAX_BACKOFF"]))
+        self.adapter_path = "/org/bluez/" + cfg["ADAPTER"]
+        self.dev_path = self.adapter_path + "/dev_" + self.host.replace(":", "_")
+
+        self.bus = dbus.SystemBus()
+        self.agent = Agent(self.bus, self)
+        self.ready = False
+        self.connecting = False
+        self.failures = 0
+        self.next_dial = 0.0
+        self.link_was_up = None
+        self.link_up_since = 0.0
+        self.link_role = None
+        self.last_dhcp_kick = 0.0
+        self.last_sdp_refresh = 0.0
+        self.last_error = None
+        self.bus.watch_name_owner(BLUEZ, self.on_bluez_owner)
+
+    # ---- helpers -------------------------------------------------------
+    def obj(self, path):
+        return self.bus.get_object(BLUEZ, path)
+
+    def get(self, path, iface, name):
+        return self.obj(path).Get(iface, name, dbus_interface=PROPS)
+
+    def set(self, path, iface, name, value):
+        self.obj(path).Set(iface, name, value, dbus_interface=PROPS)
+
+    def addr_of(self, device_path):
+        try:
+            return str(self.get(device_path, "org.bluez.Device1", "Address")).upper()
+        except dbus.DBusException:
+            return str(device_path).rsplit("dev_", 1)[-1].replace("_", ":").upper()
+
+    def managed(self):
+        om = dbus.Interface(self.obj("/"), "org.freedesktop.DBus.ObjectManager")
+        return om.GetManagedObjects()
+
+    def bnep_links(self):
+        links = set()
+        brif = "/sys/class/net/%s/brif" % self.bridge
+        if os.path.isdir(brif):
+            links.update(n for n in os.listdir(brif) if n.startswith("bnep"))
+        links.update(n for n in os.listdir("/sys/class/net") if n.startswith("bnep"))
+        return sorted(links)
+
+    # ---- bluetoothd lifecycle -----------------------------------------
+    def on_bluez_owner(self, owner):
+        if owner:
+            log.info("bluetoothd is on the bus (%s)", owner)
+        else:
+            log.warning("bluetoothd left the bus")
+        self.ready = False
+        self.connecting = False
+
+    def setup(self):
+        objs = self.managed()
+        if self.adapter_path not in objs:
+            raise RuntimeError("adapter %s not present" % self.adapter_path)
+        unblock_rfkill()
+        a = "org.bluez.Adapter1"
+        if not self.get(self.adapter_path, a, "Powered"):
+            self.set(self.adapter_path, a, "Powered", dbus.Boolean(True))
+            time.sleep(1)
+        self.set(self.adapter_path, a, "Pairable", dbus.Boolean(True))
+        self.set(self.adapter_path, a, "PairableTimeout", dbus.UInt32(0))
+        self.set(self.adapter_path, a, "DiscoverableTimeout", dbus.UInt32(0))
+
+        am = dbus.Interface(self.obj("/org/bluez"), "org.bluez.AgentManager1")
+        try:
+            am.UnregisterAgent(AGENT_PATH)
+        except dbus.DBusException:
+            pass
+        am.RegisterAgent(AGENT_PATH, "NoInputNoOutput")
+        am.RequestDefaultAgent(AGENT_PATH)
+
+        ns = dbus.Interface(self.obj(self.adapter_path), "org.bluez.NetworkServer1")
+        try:
+            ns.Unregister("nap")
+        except dbus.DBusException:
+            pass
+        ns.Register("nap", self.bridge)
+        log.info("adapter ready: powered, pairable, agent + NAP server on %s", self.bridge)
+        self.ready = True
+
+    # ---- main loop -----------------------------------------------------
+    def tick(self):
+        try:
+            self._tick()
+        except Exception as e:  # keep the loop alive no matter what
+            msg = str(e)
+            if msg != self.last_error:  # don't flood the journal with repeats
+                log.warning("check failed: %s", msg)
+                self.last_error = msg
+            self.ready = False
+        else:
+            self.last_error = None
+        return True
+
+    def _tick(self):
+        if not self.ready:
+            self.setup()
+
+        objs = self.managed()
+        dev = objs.get(self.dev_path, {}).get("org.bluez.Device1", {})
+        paired = bool(dev.get("Paired", False)) or bool(dev.get("Bonded", False))
+
+        want_disc = self.mode == "always" or (self.mode == "auto" and not paired)
+        if bool(self.get(self.adapter_path, "org.bluez.Adapter1", "Discoverable")) != want_disc:
+            self.set(self.adapter_path, "org.bluez.Adapter1", "Discoverable", dbus.Boolean(want_disc))
+            log.info("discoverable %s (host paired: %s)", "on" if want_disc else "off", paired)
+
+        if not paired:
+            if self.link_was_up is not False:
+                log.info("waiting for host %s to pair", self.host)
+                self.link_was_up = False
+            return
+        if not dev.get("Trusted", False):
+            self.set(self.dev_path, "org.bluez.Device1", "Trusted", dbus.Boolean(True))
+            log.info("host %s marked trusted", self.host)
+
+        links = self.bnep_links()
+        if links:
+            now = time.time()
+            if not self.link_was_up:
+                log.info("PAN link up: %s", ",".join(links))
+                self.link_up_since = now
+            self.link_was_up = True
+            self.failures = 0
+            # The DHCP client can sit in a long backoff from before the host
+            # started serving; kick it if the link has no IPv4 address yet.
+            if (self.link_role != "panu" and now - self.link_up_since > DHCP_GRACE
+                    and now - self.last_dhcp_kick > DHCP_KICK_EVERY
+                    and not bridge_has_ipv4(self.bridge)):
+                self.last_dhcp_kick = now
+                log.info("no IPv4 lease on %s; restarting DHCP", self.bridge)
+                subprocess.run(["networkctl", "reconfigure", self.bridge], check=False)
+            return
+        if self.link_was_up:
+            log.warning("PAN link down")
+        self.link_was_up = False
+        self.link_role = None
+
+        if not self.dial_host or self.connecting or time.time() < self.next_dial:
+            return
+        if "org.bluez.Network1" not in objs.get(self.dev_path, {}):
+            # No PAN service known (e.g. right after an SDP cache refresh):
+            # an ACL connect makes bluetoothd browse the host's SDP records.
+            log.info("host PAN services unknown; resolving via SDP")
+            self.next_dial = time.time() + 15
+            self.obj(self.dev_path).Connect(dbus_interface="org.bluez.Device1",
+                                            reply_handler=lambda: None,
+                                            error_handler=lambda e: None, timeout=30)
+            return
+        # NAP: host is sharing internet (Windows Mobile hotspot over Bluetooth).
+        # PANU: plain point-to-point link (host not sharing); SSH still works.
+        self.connecting = True
+        self.dial(["nap", "panu"], [])
+
+    def dial(self, roles, errors):
+        role, rest = roles[0], roles[1:]
+        net = dbus.Interface(self.obj(self.dev_path), "org.bluez.Network1")
+
+        def failed(err):
+            errors.append((role, err.get_dbus_name()))
+            if rest:
+                self.dial(rest, errors)
+            else:
+                self.on_dial_err(errors)
+
+        net.Connect(role, reply_handler=lambda iface: self.on_dial_ok(role, iface),
+                    error_handler=failed, timeout=45)
+
+    def on_dial_ok(self, role, iface):
+        self.connecting = False
+        self.failures = 0
+        self.link_role = role
+        log.info("dialed host %s service: %s", role.upper(), iface)
+
+    def on_dial_err(self, errors):
+        self.connecting = False
+        self.failures += 1
+        delay = min(self.interval * (2 ** min(self.failures, 6)), self.max_backoff)
+        self.next_dial = time.time() + delay
+        log.info("dial host failed (%s); retry in %ds",
+                 ", ".join("%s: %s" % (r.upper(), e.rsplit(".", 1)[-1]) for r, e in errors), delay)
+        # NotSupported = BlueZ's cached SDP record lacks that role. Windows swaps
+        # its NAP/PANU records when Mobile hotspot is toggled, so re-read them.
+        if any(e.endswith("NotSupported") for _, e in errors):
+            self.request_sdp_refresh()
+
+    def request_sdp_refresh(self):
+        try:
+            with open(SDP_STAMP) as f:
+                last = float(f.read().strip() or 0)
+        except (OSError, ValueError):
+            last = 0.0
+        if time.time() - last < SDP_REFRESH_EVERY:
+            return
+        with open(SDP_STAMP, "w") as f:
+            f.write(str(time.time()))
+        log.warning("host SDP records look stale; refreshing BlueZ's cache "
+                    "(restarts bluetoothd)")
+        # Runs outside this unit: stopping bluetooth.service also stops us.
+        subprocess.run(["systemd-run", "--no-block", "--unit=bt-autoconnect-sdp-refresh",
+                        "--collect", os.path.abspath(sys.argv[0]), "--refresh-sdp"], check=False)
+
+
+def bridge_has_ipv4(bridge):
+    out = subprocess.run(["ip", "-4", "-o", "addr", "show", "dev", bridge, "scope", "global"],
+                         capture_output=True, text=True, check=False).stdout
+    return bool(out.strip())
+
+
+def refresh_sdp(cfg):
+    """Drop the cached service list of HOST_MAC so bluetoothd browses SDP again."""
+    host = cfg["HOST_MAC"].upper()
+    subprocess.run(["systemctl", "stop", "bluetooth.service"], check=False)
+    for info in glob.glob("/var/lib/bluetooth/*/%s/info" % host):
+        with open(info) as f:
+            lines = f.readlines()
+        with open(info, "w") as f:
+            f.writelines(l for l in lines if not l.startswith("Services="))
+        log.info("cleared cached services in %s", info)
+    subprocess.run(["systemctl", "start", "bluetooth.service"], check=False)
+    subprocess.run(["systemctl", "start", "bt-autoconnect.service"], check=False)
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                        format="%(levelname)s %(message)s")
+    cfg = load_conf()
+    if not cfg["HOST_MAC"]:
+        log.error("HOST_MAC is not set in %s", CONF_FILE)
+        return 2
+    if "--refresh-sdp" in sys.argv[1:]:
+        refresh_sdp(cfg)
+        return 0
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    d = Daemon(cfg)
+    loop = GLib.MainLoop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: loop.quit())
+    GLib.idle_add(lambda: d.tick() and False)
+    GLib.timeout_add_seconds(d.interval, d.tick)
+    log.info("started: host=%s bridge=%s pairing=%s dial=%s",
+             d.host, d.bridge, d.mode, d.dial_host)
+    loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
